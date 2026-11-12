@@ -22,6 +22,18 @@ use wire_types::{
     UploadAssetArguments, UploadChunksArguments,
 };
 
+/// Where `on_domain_config_update` writes the canister's alternative origins,
+/// which is where Internet Identity looks for them.
+pub const ALTERNATIVE_ORIGINS_KEY: &str = "/.well-known/ii-alternative-origins";
+
+/// Where `on_domain_config_update` writes the canister's custom domains, which
+/// is where the boundary nodes look for them.
+pub const IC_DOMAINS_KEY: &str = "/.well-known/ic-domains";
+
+/// The most domain names `on_domain_config_update` accepts for one canister:
+/// the number of alternative origins Internet Identity accepts in one file.
+pub const MAX_DOMAINS: usize = 10;
+
 impl State {
     /// Begins a sync, returning a fresh session id.
     ///
@@ -136,8 +148,11 @@ impl State {
         StartSyncResult::Started { session_id }
     }
 
-    /// Opens a one-asset sync for the `upload_asset` endpoint and returns the
-    /// final `execute_operations` call that writes it. The caller drives that
+    /// Opens a sync that writes just `assets` — one for the `upload_asset`
+    /// endpoint, a fixed few for `on_domain_config_update` — and returns the
+    /// final `execute_operations` call that writes them. All of them ride in
+    /// that one call, which applies all-or-nothing, so several files derived
+    /// from the same input can never be left disagreeing. The caller drives that
     /// call to completion exactly as it would a sync's own, so the write, the
     /// redirect-rule re-certification and the state-hash recompute all go
     /// through the one tested path rather than a second copy of it.
@@ -152,43 +167,47 @@ impl State {
     /// a direct write would bypass the vote, and an asset that no build
     /// contains could never be reproduced anyway.
     ///
-    /// The content becomes the asset's identity encoding and nothing else: any
+    /// Each content becomes its asset's identity encoding and nothing else: any
     /// existing asset at `key` is deleted first, so stale compressed copies go
     /// with it. Keeping no compressed encoding is also what keeps the
     /// preparation canary truthful, since the canary vouches only for encodings
     /// a client's compressors produced.
-    pub fn begin_upload_asset(
+    pub fn begin_upload_assets(
         &mut self,
         owner: Principal,
-        arg: UploadAssetArguments,
+        assets: Vec<UploadAssetArguments>,
         system_context: &SystemContext,
     ) -> Result<ExecuteOperationsArguments, String> {
         if self.governance_enabled() {
             return Err(
-                "upload_asset is disabled in by-proposal mode: add the file to the \
-                 project and deploy it through a proposal"
+                "writing assets outside a deploy is disabled in by-proposal mode: add \
+                 the file to the project and deploy it through a proposal"
                     .to_string(),
             );
         }
-        if !arg.key.starts_with('/') {
-            return Err(format!("asset key must start with '/': {:?}", arg.key));
-        }
-        // A 404/410 page is served only from a single chunk; a bigger one would
-        // silently give way to the built-in 404. A sync refuses the same.
-        if arg.content.len() > MAX_CHUNK_SIZE
-            && let Some(rule) = self
-                .store
-                .redirect_rules()
-                .iter()
-                .find(|r| matches!(r.status, 404 | 410) && r.to == arg.key)
-        {
-            return Err(format!(
-                "{} is served as a {} error page, which must fit in one chunk \
-                 ({MAX_CHUNK_SIZE} bytes), but this upload is {} bytes",
-                arg.key,
-                rule.status,
-                arg.content.len()
-            ));
+        // Every refusal comes before the lock is taken, so a rejected call
+        // leaves no session behind.
+        for arg in &assets {
+            if !arg.key.starts_with('/') {
+                return Err(format!("asset key must start with '/': {:?}", arg.key));
+            }
+            // A 404/410 page is served only from a single chunk; a bigger one would
+            // silently give way to the built-in 404. A sync refuses the same.
+            if arg.content.len() > MAX_CHUNK_SIZE
+                && let Some(rule) = self
+                    .store
+                    .redirect_rules()
+                    .iter()
+                    .find(|r| matches!(r.status, 404 | 410) && r.to == arg.key)
+            {
+                return Err(format!(
+                    "{} is served as a {} error page, which must fit in one chunk \
+                     ({MAX_CHUNK_SIZE} bytes), but this upload is {} bytes",
+                    arg.key,
+                    rule.status,
+                    arg.content.len()
+                ));
+            }
         }
         if let Some(active) = &self.sync_session {
             let idle = system_context
@@ -214,67 +233,145 @@ impl State {
             }
         };
 
-        let UploadAssetArguments {
-            key,
-            content_type,
-            headers,
-            content,
-        } = arg;
-        // Hashed here rather than trusted: unlike a sync, no client prepared
-        // these bytes, and hashing a single ingress message is cheap.
-        let sha256 = Sha256::digest(&content).to_vec();
-        // Split at the boundary a sync preparing the same file from `dir` would
-        // use. The state hash folds in the chunk layout, so one oversized chunk
-        // would never reproduce from source, and a later sync whose whole-content
-        // hash matches would keep it rather than re-upload it.
-        // An empty file is one empty chunk, as `asset-prep` stores it.
-        let pieces: Vec<&[u8]> = if content.is_empty() {
-            vec![&[][..]]
-        } else {
-            content.chunks(MAX_CHUNK_SIZE).collect()
-        };
-        // The per-chunk hashes are only read for a multi-chunk encoding.
-        let chunk_sha256: Vec<ByteBuf> = if pieces.len() > 1 {
-            pieces
-                .iter()
-                .map(|piece| ByteBuf::from(Sha256::digest(piece).to_vec()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let chunk_ids: Vec<ChunkId> = pieces
-            .into_iter()
-            .map(|piece| {
-                let id = self.chunks.len() as ChunkId;
-                self.chunks.push(Some(ByteBuf::from(piece.to_vec())));
-                id
-            })
-            .collect();
+        let mut operations = Vec::with_capacity(3 * assets.len());
+        for arg in assets {
+            let UploadAssetArguments {
+                key,
+                content_type,
+                headers,
+                content,
+            } = arg;
+            // Hashed here rather than trusted: unlike a sync, no client prepared
+            // these bytes, and hashing a single ingress message is cheap.
+            let sha256 = Sha256::digest(&content).to_vec();
+            // Split at the boundary a sync preparing the same file from `dir` would
+            // use. The state hash folds in the chunk layout, so one oversized chunk
+            // would never reproduce from source, and a later sync whose whole-content
+            // hash matches would keep it rather than re-upload it.
+            // An empty file is one empty chunk, as `asset-prep` stores it.
+            let pieces: Vec<&[u8]> = if content.is_empty() {
+                vec![&[][..]]
+            } else {
+                content.chunks(MAX_CHUNK_SIZE).collect()
+            };
+            // The per-chunk hashes are only read for a multi-chunk encoding.
+            let chunk_sha256: Vec<ByteBuf> = if pieces.len() > 1 {
+                pieces
+                    .iter()
+                    .map(|piece| ByteBuf::from(Sha256::digest(piece).to_vec()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let chunk_ids: Vec<ChunkId> = pieces
+                .into_iter()
+                .map(|piece| {
+                    let id = self.chunks.len() as ChunkId;
+                    self.chunks.push(Some(ByteBuf::from(piece.to_vec())));
+                    id
+                })
+                .collect();
 
-        let mut operations = Vec::with_capacity(3);
-        if self.effective_contains_asset(&key) {
-            operations.push(Operation::DeleteAsset(DeleteAssetArguments {
+            if self.effective_contains_asset(&key) {
+                operations.push(Operation::DeleteAsset(DeleteAssetArguments {
+                    key: key.clone(),
+                }));
+            }
+            operations.push(Operation::CreateAsset(CreateAssetArguments {
                 key: key.clone(),
+                content_type,
+                headers,
+            }));
+            operations.push(Operation::SetAssetContent(SetAssetContentArguments {
+                key,
+                encoding: Encoding::Identity,
+                chunk_ids,
+                sha256: ByteBuf::from(sha256),
+                chunk_sha256,
             }));
         }
-        operations.push(Operation::CreateAsset(CreateAssetArguments {
-            key: key.clone(),
-            content_type,
-            headers,
-        }));
-        operations.push(Operation::SetAssetContent(SetAssetContentArguments {
-            key,
-            encoding: Encoding::Identity,
-            chunk_ids,
-            sha256: ByteBuf::from(sha256),
-            chunk_sha256,
-        }));
 
         Ok(ExecuteOperationsArguments {
             session_id,
             operations,
             is_final: true,
         })
+    }
+
+    /// Builds the uploads behind the `on_domain_config_update` endpoint: the
+    /// two well-known files derived from the domain names `domains` assigns to
+    /// `canister_id`.
+    ///
+    /// - [`ALTERNATIVE_ORIGINS_KEY`], the JSON list of `https://<name>` origins
+    ///   that lets Internet Identity hand out the same principals on each
+    ///   domain. Served with a CORS header, since Internet Identity fetches it
+    ///   from its own origin.
+    /// - [`IC_DOMAINS_KEY`], the plain-text list, one name per line, that the
+    ///   boundary nodes read when registering a custom domain.
+    ///
+    /// `domains` maps canister ids to domain names, so one payload can be sent
+    /// unchanged to every canister it covers and each picks out its own entry.
+    /// A payload that does not name this canister is refused rather than read
+    /// as "no domains": it was most likely sent to the wrong canister, and an
+    /// error leaves the existing files alone. An entry with an empty list is
+    /// explicit, and writes two empty lists.
+    ///
+    /// Names are held to the hostname alphabet, which is also what lets the
+    /// JSON be written without an escaper. Internet Identity ignores a file
+    /// listing more than [`MAX_DOMAINS`] origins, so a longer list is refused
+    /// outright rather than written to one file and truncated in the other.
+    pub fn domain_config_uploads(
+        canister_id: Principal,
+        domains: Vec<(Principal, Vec<String>)>,
+    ) -> Result<Vec<UploadAssetArguments>, String> {
+        let mut entries = domains.into_iter().filter(|(id, _)| *id == canister_id);
+        let Some((_, domains)) = entries.next() else {
+            return Err(format!("no entry for this canister ({canister_id})"));
+        };
+        if entries.next().is_some() {
+            return Err(format!(
+                "more than one entry for this canister ({canister_id})"
+            ));
+        }
+        if domains.len() > MAX_DOMAINS {
+            return Err(format!(
+                "{} domain names, but at most {MAX_DOMAINS} are accepted (the number \
+                 of alternative origins Internet Identity allows)",
+                domains.len()
+            ));
+        }
+        let mut origins = Vec::with_capacity(domains.len());
+        let mut lines = String::new();
+        for domain in &domains {
+            let valid = !domain.is_empty()
+                && domain
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+            if !valid {
+                return Err(format!(
+                    "invalid domain name {domain:?}: expected a bare hostname such as \
+                     \"example.com\" (letters, digits, '-' and '.')"
+                ));
+            }
+            origins.push(format!("\"https://{domain}\""));
+            lines.push_str(domain);
+            lines.push('\n');
+        }
+        let origins = format!("{{\"alternativeOrigins\":[{}]}}", origins.join(","));
+        Ok(vec![
+            UploadAssetArguments {
+                key: ALTERNATIVE_ORIGINS_KEY.to_string(),
+                content_type: "application/json".to_string(),
+                headers: vec![("Access-Control-Allow-Origin".to_string(), "*".to_string())],
+                content: ByteBuf::from(origins.into_bytes()),
+            },
+            UploadAssetArguments {
+                key: IC_DOMAINS_KEY.to_string(),
+                content_type: "text/plain".to_string(),
+                headers: Vec::new(),
+                content: ByteBuf::from(lines.into_bytes()),
+            },
+        ])
     }
 
     /// Checks that `session_id` still names the active sync and that the sync is

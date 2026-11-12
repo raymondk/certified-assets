@@ -90,6 +90,30 @@ canister's new state hash. Things to know:
 
 The next deploy deletes the file, unless `_preserve` names it.
 
+### Updating the domain configuration
+
+`on_domain_config_update` tells a canister which domain names it is served from. It
+takes a list of canister IDs, each with its domain names:
+
+```bash
+icp canister call frontend on_domain_config_update '(vec { record { principal "ryjl3-tyaaa-aaaaa-aaaba-cai"; vec { "example.com"; "www.example.com" } } })'
+```
+
+The canister that receives the call writes two files from the names listed for it:
+
+- `/.well-known/ii-alternative-origins`, so that
+  [Internet Identity](https://docs.internetcomputer.org/guides/authentication/internet-identity/#alternative-origins)
+  gives a user the same identity on each of those domains.
+- `/.well-known/ic-domains`, the list the boundary nodes read when registering a
+  [custom domain](#custom-domains).
+
+Because each canister picks out its own entry, the same argument can be sent to every
+canister it lists. Names are bare hostnames, without `https://`, and at most 10 per
+canister, which is Internet Identity's limit. The call is rejected if the list has no
+entry for the canister. Each call replaces both files, or neither if it is rejected.
+Everything above about `upload_asset` applies here too, including that the next deploy
+deletes the files unless `_preserve` names them.
+
 ### Listing files in `_preserve`
 
 List the paths a deploy should keep, one per line, in a `_preserve` file at the root of
