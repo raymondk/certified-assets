@@ -147,6 +147,19 @@ async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
     canister_core::upload_asset(arg).await
 }
 
+// Tells the canister its domain configuration changed. The argument maps
+// canister ids to domain names, so one payload can be sent to many canisters; a
+// canister it does not name traps, as does one given more than 10 names. Today
+// the reaction is to write two files from those names, in one sync:
+// `/.well-known/ii-alternative-origins` for Internet Identity and
+// `/.well-known/ic-domains` for the boundary nodes. Same caveats as
+// `upload_asset`. Named for the event rather than those actions because more
+// reactions are expected.
+#[update(guard = "guard_can_sync")]
+async fn on_domain_config_update(domains: Vec<(Principal, Vec<String>)>) -> ByteBuf {
+    canister_core::on_domain_config_update(domains).await
+}
+
 // ───────── Access protection ─────────
 // Controller-only configuration for the "private app" gate. None of these touch
 // the serving hot path; all serving (including login validation) stays in the

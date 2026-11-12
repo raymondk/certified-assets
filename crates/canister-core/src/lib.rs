@@ -159,13 +159,19 @@ pub async fn execute_operations(arg: ExecuteOperationsArguments) -> Option<ByteB
 /// Internally a one-asset sync — it takes the sync lock and runs a single final
 /// `execute_operations` call — so it certifies, re-certifies redirect rules and
 /// recomputes the hash exactly as a deploy does. See
-/// [`State::begin_upload_asset`] for when it is refused.
+/// [`State::begin_upload_assets`] for when it is refused.
 pub async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
+    upload_assets(vec![arg]).await
+}
+
+/// Writes `assets` in one sync of their own: one lock, one final
+/// `execute_operations` call, so either all of them change or none does.
+async fn upload_assets(assets: Vec<UploadAssetArguments>) -> ByteBuf {
     let system_context = SystemContext::new();
     let caller = msg_caller();
 
     let call = STATE.with_borrow_mut(|s| {
-        let call = s.begin_upload_asset(caller, arg, &system_context);
+        let call = s.begin_upload_assets(caller, assets, &system_context);
         // As in `start_sync`: capture the env before any asset is certified, so
         // an uploaded HTML asset carries the current `ic_env` cookie.
         if call.is_ok() {
@@ -179,6 +185,28 @@ pub async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
     execute_operations(call)
         .await
         .unwrap_or_else(|| trap("upload did not finalize"))
+}
+
+/// Reacts to a change in the canister's domain configuration, and returns the
+/// recomputed state hash.
+///
+/// `domains` maps canister ids to domain names; the canister looks up its own
+/// id and traps if it is not named, or if it is given more than 10 names. It
+/// then writes two files from those names, together or not at all:
+/// `/.well-known/ii-alternative-origins`, so Internet Identity hands out the
+/// same principals on every domain, and `/.well-known/ic-domains`, which the
+/// boundary nodes read when registering a custom domain.
+///
+/// The write has everything an [`upload_asset`] implies: refused in by-proposal
+/// mode and during a sync, in no build, and deleted by the next sync unless
+/// `_preserve` names the files.
+///
+/// Named for the event, not the action, because further reactions are expected
+/// to be added here.
+pub async fn on_domain_config_update(domains: Vec<(Principal, Vec<String>)>) -> ByteBuf {
+    let assets = State::domain_config_uploads(ic_cdk::api::canister_self(), domains)
+        .unwrap_or_else(|msg| trap(&msg));
+    upload_assets(assets).await
 }
 
 pub fn get_asset_details(start_after: Option<String>) -> Vec<AssetDetails> {

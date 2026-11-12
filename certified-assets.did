@@ -367,6 +367,30 @@ service: (opt InitArgs) -> {
   // message (~2 MB).
   upload_asset: (UploadAssetArguments) -> (blob);
 
+  // Notify the canister that its domain configuration changed. Returns the
+  // recomputed state hash.
+  //
+  // The argument maps canister ids to domain names, so the same payload can be
+  // sent to every canister it covers; each looks up its own id. Rejected if the
+  // map has no entry (or more than one) for this canister, if it lists more
+  // than 10 names, or if a name is not a bare hostname such as `example.com`.
+  //
+  // Named for the event because the canister's reactions are expected to grow.
+  // Today it writes two files from its names, replacing any previous ones,
+  // both or neither:
+  // - `/.well-known/ii-alternative-origins`, the JSON file Internet Identity
+  //   reads, listing each name as an `https://` origin and served with
+  //   `Access-Control-Allow-Origin: *`. The 10-name limit is Internet
+  //   Identity's.
+  // - `/.well-known/ic-domains`, the `text/plain` file the boundary nodes read
+  //   when registering a custom domain, one name per line.
+  // An entry with no names writes two empty lists.
+  //
+  // The write is an `upload_asset` underneath, so the same caveats apply:
+  // rejected during a sync and in by-proposal mode, and the next sync deletes
+  // the files unless `_preserve` names them.
+  on_domain_config_update: (vec record { principal; vec text }) -> (blob);
+
   // ───────── Authorization ─────────
   // A set of extra principals authorized to sync assets. Canister controllers
   // are always authorized (without being listed) and are the only callers that

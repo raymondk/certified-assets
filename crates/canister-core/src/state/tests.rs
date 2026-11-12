@@ -1298,14 +1298,14 @@ mod hashing {
         for (key, content) in [("/big.bin", &big[..]), ("/empty.txt", &b""[..])] {
             let asset = prepared.assets.iter().find(|a| a.key == key).unwrap();
             let call = state
-                .begin_upload_asset(
+                .begin_upload_assets(
                     some_principal(),
-                    wire_types::UploadAssetArguments {
+                    vec![wire_types::UploadAssetArguments {
                         key: key.to_string(),
                         content_type: asset.content_type.clone(),
                         headers: asset.headers.clone(),
                         content: ByteBuf::from(content.to_vec()),
-                    },
+                    }],
                     &ctx,
                 )
                 .unwrap();
@@ -5440,7 +5440,7 @@ mod upload_asset {
         arg: UploadAssetArguments,
         ctx: &SystemContext,
     ) -> Result<[u8; 32], String> {
-        let call = state.begin_upload_asset(some_principal(), arg, ctx)?;
+        let call = state.begin_upload_assets(some_principal(), vec![arg], ctx)?;
         run_computation_until_completion(|progress| state.execute_operations(&call, progress, ctx))
             .map(|hash| hash.expect("an upload is a final call, so it returns the hash"))
     }
@@ -5493,6 +5493,186 @@ mod upload_asset {
         assert_eq!(state.recompute_state_hash(), hash);
         // The lock is released: an ordinary sync can start straight away.
         start_session(&mut state, &ctx);
+    }
+
+    mod domain_config {
+        use super::*;
+        use crate::state::sync::{ALTERNATIVE_ORIGINS_KEY, IC_DOMAINS_KEY};
+
+        fn other_principal() -> Principal {
+            Principal::from_text("rdmx6-jaaaa-aaaaa-aaadq-cai").unwrap()
+        }
+
+        fn domains(names: &[&str]) -> Vec<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        }
+
+        /// Drives `on_domain_config_update` the way the canister does, with
+        /// `some_principal()` standing in for the canister's own id.
+        fn update(
+            state: &mut State,
+            config: Vec<(Principal, Vec<String>)>,
+            ctx: &SystemContext,
+        ) -> Result<[u8; 32], String> {
+            let assets = State::domain_config_uploads(some_principal(), config)?;
+            let call = state.begin_upload_assets(some_principal(), assets, ctx)?;
+            run_computation_until_completion(|progress| {
+                state.execute_operations(&call, progress, ctx)
+            })
+            .map(|hash| hash.expect("a final call returns the hash"))
+        }
+
+        fn body(state: &State, key: &str) -> Vec<u8> {
+            let response = certified_http_request(state, RequestBuilder::get(key).build());
+            assert_eq!(response.status_code, 200, "{key}");
+            response.body.to_vec()
+        }
+
+        #[test]
+        fn serves_this_canisters_domains_in_both_well_known_files() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            let hash = update(
+                &mut state,
+                vec![
+                    (other_principal(), domains(&["other.example"])),
+                    (
+                        some_principal(),
+                        domains(&["example.com", "www.example.com"]),
+                    ),
+                ],
+                &ctx,
+            )
+            .unwrap();
+
+            let origins = certified_http_request(
+                &state,
+                RequestBuilder::get(ALTERNATIVE_ORIGINS_KEY).build(),
+            );
+            assert_eq!(origins.status_code, 200);
+            assert_eq!(
+                origins.body.as_ref(),
+                br#"{"alternativeOrigins":["https://example.com","https://www.example.com"]}"#
+            );
+            assert_eq!(
+                lookup_header(&origins, "Content-Type"),
+                Some("application/json")
+            );
+            assert_eq!(
+                lookup_header(&origins, "Access-Control-Allow-Origin"),
+                Some("*")
+            );
+
+            let ic_domains =
+                certified_http_request(&state, RequestBuilder::get(IC_DOMAINS_KEY).build());
+            assert_eq!(ic_domains.status_code, 200);
+            assert_eq!(ic_domains.body.as_ref(), b"example.com\nwww.example.com\n");
+            assert_eq!(
+                lookup_header(&ic_domains, "Content-Type"),
+                Some("text/plain")
+            );
+
+            // One sync wrote both: the hash it returned covers them, and the
+            // lock is released.
+            assert_eq!(state.recompute_state_hash(), hash);
+            start_session(&mut state, &ctx);
+        }
+
+        #[test]
+        fn a_later_call_replaces_both_files() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            for names in [&["a.example", "b.example"][..], &["c.example"][..]] {
+                update(&mut state, vec![(some_principal(), domains(names))], &ctx).unwrap();
+            }
+            assert_eq!(
+                body(&state, ALTERNATIVE_ORIGINS_KEY),
+                br#"{"alternativeOrigins":["https://c.example"]}"#
+            );
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"c.example\n");
+        }
+
+        #[test]
+        fn an_entry_with_no_domains_writes_two_empty_lists() {
+            let assets =
+                State::domain_config_uploads(some_principal(), vec![(some_principal(), vec![])])
+                    .unwrap();
+            assert_eq!(assets[0].content.as_ref(), br#"{"alternativeOrigins":[]}"#);
+            assert!(assets[1].content.is_empty());
+        }
+
+        #[test]
+        fn a_map_that_does_not_name_this_canister_is_refused() {
+            let err = State::domain_config_uploads(
+                some_principal(),
+                vec![(other_principal(), domains(&["other.example"]))],
+            )
+            .unwrap_err();
+            assert!(err.contains("no entry for this canister"), "{err}");
+        }
+
+        #[test]
+        fn a_duplicate_entry_for_this_canister_is_refused() {
+            let err = State::domain_config_uploads(
+                some_principal(),
+                vec![
+                    (some_principal(), domains(&["a.example"])),
+                    (some_principal(), domains(&["b.example"])),
+                ],
+            )
+            .unwrap_err();
+            assert!(err.contains("more than one entry"), "{err}");
+        }
+
+        #[test]
+        fn ten_domains_are_accepted_and_eleven_refused() {
+            let names =
+                |n: usize| -> Vec<String> { (0..n).map(|i| format!("d{i}.example")).collect() };
+            State::domain_config_uploads(some_principal(), vec![(some_principal(), names(10))])
+                .unwrap();
+            let err =
+                State::domain_config_uploads(some_principal(), vec![(some_principal(), names(11))])
+                    .unwrap_err();
+            assert!(err.contains("at most 10"), "{err}");
+        }
+
+        #[test]
+        fn a_name_that_is_not_a_bare_hostname_is_refused() {
+            for bad in ["", "a .example", "https://a.example", "a.example/x", "a\"b"] {
+                let err = State::domain_config_uploads(
+                    some_principal(),
+                    vec![(some_principal(), domains(&[bad]))],
+                )
+                .unwrap_err();
+                assert!(err.contains("invalid domain name"), "{bad:?}: {err}");
+            }
+        }
+
+        /// A refusal must not take the sync lock or touch the files already
+        /// served.
+        #[test]
+        fn a_refused_update_leaves_the_existing_files_and_no_session() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            update(
+                &mut state,
+                vec![(some_principal(), domains(&["a.example"]))],
+                &ctx,
+            )
+            .unwrap();
+            let before = state.cached_state_hash();
+
+            update(
+                &mut state,
+                vec![(some_principal(), domains(&["not a host"]))],
+                &ctx,
+            )
+            .unwrap_err();
+
+            assert_eq!(state.cached_state_hash(), before);
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"a.example\n");
+            start_session(&mut state, &ctx);
+        }
     }
 
     #[test]
