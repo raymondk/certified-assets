@@ -1,0 +1,3 @@
+# A generated, minified bundle (see examples/config-update/README.md). Shown as
+# one opaque change in diffs and collapsed in reviews.
+examples/config-update/launchpad/vendor/*.js -diff linguist-generated

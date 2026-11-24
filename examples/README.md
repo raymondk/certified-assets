@@ -14,6 +14,7 @@ the HTTP gateway (see [`crates/e2e/`](../crates/e2e/)), so these stay working.
 | [catch-all-404](catch-all-404/) | A `/*` catch-all serving a custom 404 page for every unknown URL. |
 | [spa](spa/) | A client-side-routed single-page app: one `/* /index.html 200` rule, so every URL loads the shell. |
 | [access-protection](access-protection/) | Turning a public site into a private one gated behind an access token. |
+| [config-update](config-update/) | Several canisters configured by one `on_config_update` call: three sites that write their own domain files, and a launchpad whose buttons follow the config. |
 
 ## Running any example
 

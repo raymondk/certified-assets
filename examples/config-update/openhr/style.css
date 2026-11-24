@@ -1,0 +1,24 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background: Canvas;
+  color: CanvasText;
+}
+
+main {
+  padding: 2rem;
+  text-align: center;
+}
+
+h1 {
+  font-size: clamp(2rem, 6vw, 3rem);
+  border-bottom: 0.25rem solid #2563eb;
+  padding-bottom: 0.5rem;
+}

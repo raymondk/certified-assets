@@ -1,0 +1,56 @@
+networks:
+  - name: local
+    mode: managed
+    gateway:
+      port: 0
+
+canisters:
+  # Three asset canisters, one site each. The canister + sync-plugin wasms are
+  # built from this repo by `make wasm`, which writes them to the repo-root
+  # `dist/` directory.
+  - name: openhr
+    build:
+      steps:
+        - type: pre-built
+          path: ../../dist/canister.wasm
+    sync:
+      steps:
+        - type: plugin
+          path: ../../dist/plugin.wasm
+          dirs:
+            - openhr
+
+  - name: openteam
+    build:
+      steps:
+        - type: pre-built
+          path: ../../dist/canister.wasm
+    sync:
+      steps:
+        - type: plugin
+          path: ../../dist/plugin.wasm
+          dirs:
+            - openteam
+
+  - name: launchpad
+    build:
+      steps:
+        - type: pre-built
+          path: ../../dist/canister.wasm
+    sync:
+      steps:
+        - type: plugin
+          path: ../../dist/plugin.wasm
+          dirs:
+            - launchpad
+
+  # The launchpad's data: stores the map `on_config_update` delivers and serves
+  # it to the launchpad page. Its crate (`backend/`) is a member of the repo's
+  # Cargo workspace, so cargo builds it into the repo-root `target/`.
+  - name: launchpad-backend
+    build:
+      steps:
+        - type: script
+          commands:
+            - cargo build --locked -p launchpad-backend --target wasm32-unknown-unknown --profile canister-release
+            - sh -c 'cp ../../target/wasm32-unknown-unknown/canister-release/launchpad_backend.wasm "$ICP_WASM_OUTPUT_PATH"'
