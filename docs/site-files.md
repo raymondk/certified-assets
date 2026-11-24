@@ -90,6 +90,54 @@ canister's new state hash. Things to know:
 
 The next deploy deletes the file, unless `_preserve` names it.
 
+### Sending a config update
+
+`on_config_update` tells a canister about the group of canisters it belongs to. It
+takes a list of canister IDs, each with that canister's domain names, friendly name and
+icon URL:
+
+```bash
+icp canister call frontend on_config_update '(vec { record { principal "ryjl3-tyaaa-aaaaa-aaaba-cai"; record { domains = opt vec { "example.com"; "www.example.com" }; name = opt "My app"; icon = opt "https://example.com/icon.png" } } })'
+```
+
+Because each canister picks out its own entry, the same argument can be sent unchanged
+to every canister it lists, and to other canisters that implement the same method. The
+call is rejected if the list has no entry for the canister that receives it, or more
+than one.
+
+All three fields are optional. An asset canister acts on `domains` only:
+
+| `domains` | What the canister does |
+|-----------|------------------------|
+| `opt vec { "example.com"; ... }` | Writes the two files below from the names. |
+| `opt vec {}` | Writes the two files as empty lists. |
+| `null`, or left out | Nothing. The files stay as they are and the call succeeds. |
+
+The two files are:
+
+- `/.well-known/ii-alternative-origins`, so that
+  [Internet Identity](https://docs.internetcomputer.org/guides/authentication/internet-identity/#alternative-origins)
+  gives a user the same identity on each of those domains.
+- `/.well-known/ic-domains`, the list the boundary nodes read when registering a
+  [custom domain](#custom-domains).
+
+Names are bare hostnames, without `https://`. A canister takes at most 100, which is
+Internet Identity's limit, and each name once. Each call that writes replaces both
+files, or neither if it is rejected.
+
+`name` and `icon` are there for other canisters that receive the same argument, such as
+a launcher page listing your apps. An asset canister ignores them. The
+[`config-update` example](https://github.com/dfinity/certified-assets/tree/main/examples/config-update)
+shows both kinds of receiver.
+
+Everything above about `upload_asset` applies to the two files too, including that the
+next deploy deletes them unless `_preserve` names them:
+
+```
+/.well-known/ii-alternative-origins
+/.well-known/ic-domains
+```
+
 ### Listing files in `_preserve`
 
 List the paths a deploy should keep, one per line, in a `_preserve` file at the root of

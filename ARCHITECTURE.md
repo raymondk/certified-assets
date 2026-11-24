@@ -25,7 +25,7 @@ Each deployable module is a logic **library** plus a thin **wasm wrapper**
 the logic and compile natively, so the bulk of the code is exercised by ordinary
 `cargo test` without a replica; the matching wrapper is just the wasm build target.
 A few dependency-light **support libraries** are shared across modules, and one
-**native binary** is the standalone verifier. All crates live under
+**native binary** is the standalone verifier. All of these crates live under
 [`crates/`](crates/):
 
 | Crate | Kind | Role |
@@ -44,6 +44,11 @@ A few dependency-light **support libraries** are shared across modules, and one
 The local preparation (`asset-prep`) is deliberately split from the canister-call
 orchestration (`sync-core`) so the verifier can reuse the *exact* preparation a sync
 runs without linking any deploy capability.
+
+The workspace has one more member outside `crates/`: the backend canister of the
+[`config-update`](examples/config-update/) example, at
+`examples/config-update/backend/`. It is part of that example, not of the product, and
+is listed as a member so that it shares the workspace's lockfile and lints.
 
 ## How a request is served
 

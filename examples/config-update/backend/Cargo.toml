@@ -1,0 +1,21 @@
+[package]
+name = "launchpad-backend"
+description = "The launchpad's backend canister in examples/config-update"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid.workspace = true
+ic-cdk.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+candid_parser.workspace = true

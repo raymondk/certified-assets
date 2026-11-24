@@ -14,7 +14,8 @@ An ICP assets canister and `icp-cli` sync plugin for serving certified static as
   [how it works](docs/how-it-works.md).
 - **Examples** — runnable projects in [`examples/`](examples/): a minimal static
   site, custom headers, redirects, clean URLs, a catch-all 404, a single-page app,
-  and access protection. Each deploys with `icp deploy` and doubles as an e2e test.
+  access protection, and a config update shared by several canisters. Each deploys
+  with `icp deploy` and doubles as an e2e test.
 - **Hacking on it** — see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the crate layout
   and how the canister and plugin fit together.
 

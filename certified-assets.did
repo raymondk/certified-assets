@@ -194,6 +194,24 @@ type UploadAssetArguments = record {
   content: blob;
 };
 
+// One canister's entry in a config update; see `on_config_update`. Every field
+// is optional: `null` means "not stated", which is different from stating an
+// empty value. A field added later must be `opt` too, so that an older sender
+// still works.
+type CanisterConfig = record {
+  // Domain names the canister is served from, as bare hostnames
+  // (`example.com`, no `https://`). `opt vec {}` states that it has none.
+  domains: opt vec text;
+  // Friendly, human-readable name of the canister.
+  name: opt text;
+  // URL of an icon for the canister.
+  icon: opt text;
+};
+
+// A map from canister id to that canister's config. The same value is sent
+// unchanged to every canister it covers; each looks up its own id.
+type ConfigUpdate = vec record { principal; CanisterConfig };
+
 // ───────── Access protection ─────────
 
 // Reported by `check_protection_status`. Distinguishes a public app from a
@@ -366,6 +384,33 @@ service: (opt InitArgs) -> {
   // for a key not starting with `/`. The content must fit in one ingress
   // message (~2 MB).
   upload_asset: (UploadAssetArguments) -> (blob);
+
+  // Notify the canister that the configuration of its group of canisters
+  // changed. Returns nothing; every failure is a trap.
+  //
+  // The argument maps canister ids to their configuration, so the same payload
+  // can be sent unchanged to every canister it covers; each looks up its own
+  // id. Rejected if the map has no entry (or more than one) for this canister.
+  //
+  // Named for the event because the canister's reactions are expected to grow.
+  // Today it reads only its entry's `domains`, and ignores `name` and `icon`:
+  // - `domains = null` writes nothing. The files below stay as they are and
+  //   the call succeeds.
+  // - `domains = opt vec { ... }` writes two files from the names, replacing
+  //   any previous ones, both or neither:
+  //   - `/.well-known/ii-alternative-origins`, the JSON file Internet Identity
+  //     reads, listing each name as an `https://` origin and served with
+  //     `Access-Control-Allow-Origin: *`.
+  //   - `/.well-known/ic-domains`, the `text/plain` file the boundary nodes
+  //     read when registering a custom domain, one name per line.
+  //   Rejected if it lists more than 100 names (Internet Identity's limit),
+  //   repeats a name, or a name is not a bare hostname such as `example.com`.
+  // - `domains = opt vec {}` writes the same two files as empty lists.
+  //
+  // The write is an `upload_asset` underneath, so the same caveats apply:
+  // rejected during a sync and in by-proposal mode, and the next sync deletes
+  // the files unless `_preserve` names them.
+  on_config_update: (ConfigUpdate) -> ();
 
   // ───────── Authorization ─────────
   // A set of extra principals authorized to sync assets. Canister controllers

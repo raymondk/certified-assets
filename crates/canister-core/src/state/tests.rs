@@ -1298,14 +1298,14 @@ mod hashing {
         for (key, content) in [("/big.bin", &big[..]), ("/empty.txt", &b""[..])] {
             let asset = prepared.assets.iter().find(|a| a.key == key).unwrap();
             let call = state
-                .begin_upload_asset(
+                .begin_upload_assets(
                     some_principal(),
-                    wire_types::UploadAssetArguments {
+                    vec![wire_types::UploadAssetArguments {
                         key: key.to_string(),
                         content_type: asset.content_type.clone(),
                         headers: asset.headers.clone(),
                         content: ByteBuf::from(content.to_vec()),
-                    },
+                    }],
                     &ctx,
                 )
                 .unwrap();
@@ -5440,7 +5440,7 @@ mod upload_asset {
         arg: UploadAssetArguments,
         ctx: &SystemContext,
     ) -> Result<[u8; 32], String> {
-        let call = state.begin_upload_asset(some_principal(), arg, ctx)?;
+        let call = state.begin_upload_assets(some_principal(), vec![arg], ctx)?;
         run_computation_until_completion(|progress| state.execute_operations(&call, progress, ctx))
             .map(|hash| hash.expect("an upload is a final call, so it returns the hash"))
     }
@@ -5493,6 +5493,300 @@ mod upload_asset {
         assert_eq!(state.recompute_state_hash(), hash);
         // The lock is released: an ordinary sync can start straight away.
         start_session(&mut state, &ctx);
+    }
+
+    mod config_update {
+        use super::*;
+        use crate::state::sync::{ALTERNATIVE_ORIGINS_KEY, IC_DOMAINS_KEY, MAX_DOMAINS};
+        use wire_types::CanisterConfig;
+
+        fn other_principal() -> Principal {
+            Principal::from_text("rdmx6-jaaaa-aaaaa-aaadq-cai").unwrap()
+        }
+
+        /// An entry stating `names` as its domains, and nothing else.
+        fn domains(names: &[&str]) -> CanisterConfig {
+            CanisterConfig {
+                domains: Some(names.iter().map(|n| n.to_string()).collect()),
+                ..Default::default()
+            }
+        }
+
+        /// `n` distinct, valid domain names.
+        fn distinct_domains(n: usize) -> CanisterConfig {
+            CanisterConfig {
+                domains: Some((0..n).map(|i| format!("d{i}.example")).collect()),
+                ..Default::default()
+            }
+        }
+
+        /// The uploads for a payload holding just this canister's `entry`, with
+        /// `some_principal()` standing in for the canister's own id.
+        fn uploads(entry: CanisterConfig) -> Result<Option<Vec<UploadAssetArguments>>, String> {
+            State::config_update_uploads(some_principal(), vec![(some_principal(), entry)])
+        }
+
+        /// Drives `on_config_update` the way the canister does. `Ok(None)` is a
+        /// call that succeeded without writing anything.
+        fn update(
+            state: &mut State,
+            config: Vec<(Principal, CanisterConfig)>,
+            ctx: &SystemContext,
+        ) -> Result<Option<[u8; 32]>, String> {
+            let Some(assets) = State::config_update_uploads(some_principal(), config)? else {
+                return Ok(None);
+            };
+            let call = state.begin_upload_assets(some_principal(), assets, ctx)?;
+            run_computation_until_completion(|progress| {
+                state.execute_operations(&call, progress, ctx)
+            })
+            .map(|hash| Some(hash.expect("a final call returns the hash")))
+        }
+
+        fn body(state: &State, key: &str) -> Vec<u8> {
+            let response = certified_http_request(state, RequestBuilder::get(key).build());
+            assert_eq!(response.status_code, 200, "{key}");
+            response.body.to_vec()
+        }
+
+        #[test]
+        fn serves_this_canisters_domains_in_both_well_known_files() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            let hash = update(
+                &mut state,
+                vec![
+                    (other_principal(), domains(&["other.example"])),
+                    (
+                        some_principal(),
+                        domains(&["example.com", "www.example.com"]),
+                    ),
+                ],
+                &ctx,
+            )
+            .unwrap()
+            .expect("stated domains are written");
+
+            let origins = certified_http_request(
+                &state,
+                RequestBuilder::get(ALTERNATIVE_ORIGINS_KEY).build(),
+            );
+            assert_eq!(origins.status_code, 200);
+            assert_eq!(
+                origins.body.as_ref(),
+                br#"{"alternativeOrigins":["https://example.com","https://www.example.com"]}"#
+            );
+            assert_eq!(
+                lookup_header(&origins, "Content-Type"),
+                Some("application/json")
+            );
+            assert_eq!(
+                lookup_header(&origins, "Access-Control-Allow-Origin"),
+                Some("*")
+            );
+
+            let ic_domains =
+                certified_http_request(&state, RequestBuilder::get(IC_DOMAINS_KEY).build());
+            assert_eq!(ic_domains.status_code, 200);
+            assert_eq!(ic_domains.body.as_ref(), b"example.com\nwww.example.com\n");
+            assert_eq!(
+                lookup_header(&ic_domains, "Content-Type"),
+                Some("text/plain")
+            );
+
+            // One sync wrote both: the hash it returned covers them, and the
+            // lock is released.
+            assert_eq!(state.recompute_state_hash(), hash);
+            start_session(&mut state, &ctx);
+        }
+
+        #[test]
+        fn a_later_call_replaces_both_files() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            for names in [&["a.example", "b.example"][..], &["c.example"][..]] {
+                update(&mut state, vec![(some_principal(), domains(names))], &ctx).unwrap();
+            }
+            assert_eq!(
+                body(&state, ALTERNATIVE_ORIGINS_KEY),
+                br#"{"alternativeOrigins":["https://c.example"]}"#
+            );
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"c.example\n");
+        }
+
+        /// `domains = null` says nothing about domains, which is not the same
+        /// as saying there are none: the call succeeds and writes nothing.
+        #[test]
+        fn an_entry_without_domains_leaves_the_existing_files_untouched() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            update(
+                &mut state,
+                vec![(some_principal(), domains(&["a.example"]))],
+                &ctx,
+            )
+            .unwrap();
+            let before = state.cached_state_hash();
+
+            let outcome = update(
+                &mut state,
+                vec![(
+                    some_principal(),
+                    CanisterConfig {
+                        domains: None,
+                        name: Some("Renamed".to_string()),
+                        icon: Some("https://a.example/icon.png".to_string()),
+                    },
+                )],
+                &ctx,
+            );
+
+            assert_eq!(outcome, Ok(None));
+            assert_eq!(state.cached_state_hash(), before);
+            assert_eq!(
+                body(&state, ALTERNATIVE_ORIGINS_KEY),
+                br#"{"alternativeOrigins":["https://a.example"]}"#
+            );
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"a.example\n");
+        }
+
+        /// With nothing to write there is nothing for a sync in progress to
+        /// refuse, and no file appears where there was none.
+        #[test]
+        fn an_entry_without_domains_writes_nothing_even_during_a_sync() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            start_session(&mut state, &ctx);
+
+            let outcome = update(
+                &mut state,
+                vec![(some_principal(), CanisterConfig::default())],
+                &ctx,
+            );
+
+            assert_eq!(outcome, Ok(None));
+            for key in [ALTERNATIVE_ORIGINS_KEY, IC_DOMAINS_KEY] {
+                assert!(!state.effective_contains_asset(&key.to_string()), "{key}");
+            }
+        }
+
+        /// An empty list is explicit, and replaces whatever was there.
+        #[test]
+        fn an_entry_with_an_empty_domain_list_clears_both_files() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            for names in [&["a.example"][..], &[][..]] {
+                update(&mut state, vec![(some_principal(), domains(names))], &ctx)
+                    .unwrap()
+                    .expect("an empty list is still written");
+            }
+            assert_eq!(
+                body(&state, ALTERNATIVE_ORIGINS_KEY),
+                br#"{"alternativeOrigins":[]}"#
+            );
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"");
+        }
+
+        /// `name` and `icon` belong to other receivers. Values this canister
+        /// could not use change neither the outcome nor what is written.
+        #[test]
+        fn name_and_icon_are_ignored() {
+            let plain = uploads(domains(&["a.example"])).unwrap();
+            let decorated = uploads(CanisterConfig {
+                name: Some("\"; not a hostname\n".repeat(1000)),
+                icon: Some("not a url".to_string()),
+                ..domains(&["a.example"])
+            })
+            .unwrap();
+            assert!(plain.is_some());
+            assert_eq!(decorated, plain);
+        }
+
+        #[test]
+        fn a_map_that_does_not_name_this_canister_is_refused() {
+            let err = State::config_update_uploads(
+                some_principal(),
+                vec![(other_principal(), domains(&["other.example"]))],
+            )
+            .unwrap_err();
+            assert!(err.contains("no entry for this canister"), "{err}");
+        }
+
+        /// Refused even when one of the two says nothing about domains: which
+        /// entry is meant is the question, not what they would write.
+        #[test]
+        fn a_duplicate_entry_for_this_canister_is_refused() {
+            for second in [domains(&["b.example"]), CanisterConfig::default()] {
+                let err = State::config_update_uploads(
+                    some_principal(),
+                    vec![
+                        (some_principal(), domains(&["a.example"])),
+                        (some_principal(), second),
+                    ],
+                )
+                .unwrap_err();
+                assert!(err.contains("more than one entry"), "{err}");
+            }
+        }
+
+        #[test]
+        fn a_hundred_domains_are_accepted_and_a_hundred_and_one_refused() {
+            assert_eq!(MAX_DOMAINS, 100);
+            let assets = uploads(distinct_domains(100)).unwrap().unwrap();
+            let ic_domains = String::from_utf8(assets[1].content.to_vec()).unwrap();
+            assert_eq!(ic_domains.lines().count(), 100);
+
+            let err = uploads(distinct_domains(101)).unwrap_err();
+            assert!(err.contains("at most 100"), "{err}");
+        }
+
+        #[test]
+        fn a_repeated_domain_is_refused() {
+            for names in [
+                &["a.example", "a.example"][..],
+                &["a.example", "b.example", "a.example"][..],
+                // Hostnames are case-insensitive, so this is one origin twice.
+                &["a.example", "A.Example"][..],
+            ] {
+                let err = uploads(domains(names)).unwrap_err();
+                assert!(err.contains("listed more than once"), "{names:?}: {err}");
+            }
+        }
+
+        #[test]
+        fn a_name_that_is_not_a_bare_hostname_is_refused() {
+            for bad in ["", "a .example", "https://a.example", "a.example/x", "a\"b"] {
+                let err = uploads(domains(&[bad])).unwrap_err();
+                assert!(err.contains("invalid domain name"), "{bad:?}: {err}");
+            }
+        }
+
+        /// A refusal must not take the sync lock or touch the files already
+        /// served.
+        #[test]
+        fn a_refused_update_leaves_the_existing_files_and_no_session() {
+            let mut state = State::default();
+            let ctx = mock_system_context();
+            update(
+                &mut state,
+                vec![(some_principal(), domains(&["a.example"]))],
+                &ctx,
+            )
+            .unwrap();
+            let before = state.cached_state_hash();
+
+            for refused in [
+                domains(&["not a host"]),
+                domains(&["b.example", "b.example"]),
+                distinct_domains(101),
+            ] {
+                update(&mut state, vec![(some_principal(), refused)], &ctx).unwrap_err();
+            }
+
+            assert_eq!(state.cached_state_hash(), before);
+            assert_eq!(body(&state, IC_DOMAINS_KEY), b"a.example\n");
+            start_session(&mut state, &ctx);
+        }
     }
 
     #[test]

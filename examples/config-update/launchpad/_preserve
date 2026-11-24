@@ -1,0 +1,4 @@
+# Written by `on_config_update` from this canister's domain names. No build
+# ships them, so without these lines the next deploy would delete them.
+/.well-known/ii-alternative-origins
+/.well-known/ic-domains

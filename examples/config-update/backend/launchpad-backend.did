@@ -1,0 +1,25 @@
+// The launchpad's backend: it keeps the map `on_config_update` delivers and
+// serves it to the launchpad page.
+
+// One canister's entry in a config update. The same type the asset canister
+// declares in `certified-assets.did`, so one argument suits both.
+type CanisterConfig = record {
+  // Domain names the canister is served from, as bare hostnames.
+  domains: opt vec text;
+  // Friendly, human-readable name of the canister.
+  name: opt text;
+  // URL of an icon for the canister.
+  icon: opt text;
+};
+
+// A map from canister id to that canister's config.
+type ConfigUpdate = vec record { principal; CanisterConfig };
+
+service: {
+  // Replaces the stored map with the argument. Controllers only. Rejected if a
+  // canister id appears more than once.
+  on_config_update: (ConfigUpdate) -> ();
+
+  // The stored map, in the order it was sent.
+  list_canisters: () -> (ConfigUpdate) query;
+}

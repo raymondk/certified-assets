@@ -27,8 +27,8 @@ pub use http::{HttpRequest, HttpResponse};
 pub use protection::{IssueTokenArgs, ProtectionStatus, TokenInfo};
 pub use serde_bytes::ByteBuf;
 pub use wire_types::{
-    AssetDetails, ChunkId, ExecuteOperationsArguments, InitArgs, RedirectRule, StartSyncResult,
-    UploadAssetArguments, UploadChunksArguments, Version,
+    AssetDetails, CanisterConfig, ChunkId, ExecuteOperationsArguments, InitArgs, RedirectRule,
+    StartSyncResult, UploadAssetArguments, UploadChunksArguments, Version,
 };
 
 thread_local! {
@@ -159,13 +159,19 @@ pub async fn execute_operations(arg: ExecuteOperationsArguments) -> Option<ByteB
 /// Internally a one-asset sync — it takes the sync lock and runs a single final
 /// `execute_operations` call — so it certifies, re-certifies redirect rules and
 /// recomputes the hash exactly as a deploy does. See
-/// [`State::begin_upload_asset`] for when it is refused.
+/// [`State::begin_upload_assets`] for when it is refused.
 pub async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
+    upload_assets(vec![arg]).await
+}
+
+/// Writes `assets` in one sync of their own: one lock, one final
+/// `execute_operations` call, so either all of them change or none does.
+async fn upload_assets(assets: Vec<UploadAssetArguments>) -> ByteBuf {
     let system_context = SystemContext::new();
     let caller = msg_caller();
 
     let call = STATE.with_borrow_mut(|s| {
-        let call = s.begin_upload_asset(caller, arg, &system_context);
+        let call = s.begin_upload_assets(caller, assets, &system_context);
         // As in `start_sync`: capture the env before any asset is certified, so
         // an uploaded HTML asset carries the current `ic_env` cookie.
         if call.is_ok() {
@@ -179,6 +185,40 @@ pub async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
     execute_operations(call)
         .await
         .unwrap_or_else(|| trap("upload did not finalize"))
+}
+
+/// Reacts to a change in the configuration of the group of canisters this one
+/// belongs to.
+///
+/// `config` maps canister ids to their configuration; the canister looks up
+/// its own id and traps if it is not named exactly once. Of its entry it reads
+/// only `domains`:
+///
+/// - Stated, it writes two files from those names, together or not at all:
+///   `/.well-known/ii-alternative-origins`, so Internet Identity hands out the
+///   same principals on every domain, and `/.well-known/ic-domains`, which the
+///   boundary nodes read when registering a custom domain. An empty list
+///   writes two empty lists. It traps on more than 100 names, a repeated name,
+///   or a name that is not a bare hostname.
+/// - Not stated (`null`), it writes nothing: the files already served stay as
+///   they are and the call succeeds.
+///
+/// `name` and `icon` are carried for other receivers of the same payload and
+/// are ignored here.
+///
+/// The write has everything an [`upload_asset`] implies: refused in by-proposal
+/// mode and during a sync, in no build, and deleted by the next sync unless
+/// `_preserve` names the files. Every failure is a trap, so one caller can
+/// treat every receiver of the payload alike.
+///
+/// Named for the event, not the action, because further reactions are expected
+/// to be added here.
+pub async fn on_config_update(config: Vec<(Principal, CanisterConfig)>) {
+    let assets = State::config_update_uploads(ic_cdk::api::canister_self(), config)
+        .unwrap_or_else(|msg| trap(&msg));
+    if let Some(assets) = assets {
+        upload_assets(assets).await;
+    }
 }
 
 pub fn get_asset_details(start_after: Option<String>) -> Vec<AssetDetails> {
