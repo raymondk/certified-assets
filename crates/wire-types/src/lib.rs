@@ -300,6 +300,23 @@ pub struct UploadAssetArguments {
     pub content: ByteBuf,
 }
 
+/// One canister's entry in the map the `on_config_update` endpoint takes.
+///
+/// The map describes a group of canisters, and the same map is sent unchanged
+/// to each of them, so an entry carries what any receiver might want and each
+/// receiver reads only what it uses. Every field is optional: `None` means
+/// "not stated", which is different from stating an empty value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, CandidType, Serialize, Deserialize)]
+pub struct CanisterConfig {
+    /// Domain names the canister is served from, as bare hostnames
+    /// (`example.com`, no `https://`). `Some(vec![])` states that it has none.
+    pub domains: Option<Vec<String>>,
+    /// Friendly, human-readable name of the canister.
+    pub name: Option<String>,
+    /// URL of an icon for the canister.
+    pub icon: Option<String>,
+}
+
 /// One encoding of an asset, as the `get_asset_details` query reports it.
 #[derive(Clone, Debug, PartialEq, Eq, CandidType, Serialize, Deserialize)]
 pub struct AssetEncodingDetails {

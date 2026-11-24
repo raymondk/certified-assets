@@ -1,9 +1,9 @@
 use candid::Principal;
 use canister_core::{
-    AssetDetails, ByteBuf, ChunkId, ExecuteOperationsArguments, HttpRequest, HttpResponse,
-    InitArgs, IssueTokenArgs, ProposedState, ProtectionStatus, RedirectRule, StartSyncResult,
-    TokenInfo, UploadAssetArguments, UploadChunksArguments, Version, guard_can_sync,
-    guard_is_controller, guard_is_governance,
+    AssetDetails, ByteBuf, CanisterConfig, ChunkId, ExecuteOperationsArguments, HttpRequest,
+    HttpResponse, InitArgs, IssueTokenArgs, ProposedState, ProtectionStatus, RedirectRule,
+    StartSyncResult, TokenInfo, UploadAssetArguments, UploadChunksArguments, Version,
+    guard_can_sync, guard_is_controller, guard_is_governance,
 };
 use ic_cdk::{init, post_upgrade, query, update};
 
@@ -147,17 +147,19 @@ async fn upload_asset(arg: UploadAssetArguments) -> ByteBuf {
     canister_core::upload_asset(arg).await
 }
 
-// Tells the canister its domain configuration changed. The argument maps
-// canister ids to domain names, so one payload can be sent to many canisters; a
-// canister it does not name traps, as does one given more than 10 names. Today
-// the reaction is to write two files from those names, in one sync:
-// `/.well-known/ii-alternative-origins` for Internet Identity and
-// `/.well-known/ic-domains` for the boundary nodes. Same caveats as
+// Tells the canister the configuration of its group of canisters changed. The
+// argument maps canister ids to their configuration, so one payload can be sent
+// unchanged to many canisters; a canister it does not name exactly once traps.
+// Today the reaction is to write two files from the entry's `domains`, in one
+// sync: `/.well-known/ii-alternative-origins` for Internet Identity and
+// `/.well-known/ic-domains` for the boundary nodes. An entry with no `domains`
+// writes nothing, and `name` and `icon` are ignored. Same caveats as
 // `upload_asset`. Named for the event rather than those actions because more
-// reactions are expected.
+// reactions are expected. Returns nothing and traps on failure, so a caller can
+// treat every kind of receiver alike.
 #[update(guard = "guard_can_sync")]
-async fn on_domain_config_update(domains: Vec<(Principal, Vec<String>)>) -> ByteBuf {
-    canister_core::on_domain_config_update(domains).await
+async fn on_config_update(config: Vec<(Principal, CanisterConfig)>) {
+    canister_core::on_config_update(config).await
 }
 
 // ───────── Access protection ─────────
@@ -267,4 +269,133 @@ fn candid_interface_compatibility() {
         CandidSource::File(old_interface.as_path()),
     )
     .expect("The assets canister interface is not compatible with the certified-assets.did file");
+}
+
+/// Encodes `args`, written in Candid's text form, as `on_config_update`'s
+/// argument the way a caller holding `certified-assets.did` does, and decodes
+/// the bytes as the canister does.
+#[cfg(test)]
+fn decode_config_update(args: &str) -> Vec<(Principal, CanisterConfig)> {
+    use candid_parser::utils::CandidSource;
+    use std::path::PathBuf;
+
+    let did = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../../certified-assets.did");
+    let (env, actor) = CandidSource::File(did.as_path()).load().unwrap();
+    let method = env
+        .get_method(&actor.unwrap(), "on_config_update")
+        .unwrap()
+        .clone();
+    let bytes = candid_parser::parse_idl_args(args)
+        .unwrap()
+        .to_bytes_with_types(&env, &method.args)
+        .unwrap();
+    candid::decode_one(&bytes).unwrap()
+}
+
+/// The argument is an ordinary typed Candid value, a map from canister id to
+/// a record whose fields are all optional.
+#[test]
+fn on_config_update_argument_decodes_from_its_candid_text_form() {
+    let openhr = Principal::from_text("uxrrr-q7777-77774-qaaaq-cai").unwrap();
+    let openteam = Principal::from_text("u6s2n-gx777-77774-qaaba-cai").unwrap();
+    let launchpad = Principal::from_text("uzt4z-lp777-77774-qaabq-cai").unwrap();
+
+    let decoded = decode_config_update(
+        r#"(vec {
+          record { principal "uxrrr-q7777-77774-qaaaq-cai"; record {
+            domains = opt vec { "openhr.example.com"; "hr.example.com" };
+            name = opt "OpenHR";
+            icon = opt "https://openhr.example.com/icon.png";
+          } };
+          record { principal "u6s2n-gx777-77774-qaaba-cai"; record {
+            domains = opt vec {};
+            name = null;
+            icon = null;
+          } };
+          record { principal "uzt4z-lp777-77774-qaabq-cai"; record {} };
+        })"#,
+    );
+
+    assert_eq!(
+        decoded,
+        vec![
+            (
+                openhr,
+                CanisterConfig {
+                    domains: Some(vec![
+                        "openhr.example.com".to_string(),
+                        "hr.example.com".to_string()
+                    ]),
+                    name: Some("OpenHR".to_string()),
+                    icon: Some("https://openhr.example.com/icon.png".to_string()),
+                }
+            ),
+            (
+                openteam,
+                CanisterConfig {
+                    // Stated as empty, which is not the same as left out.
+                    domains: Some(vec![]),
+                    name: None,
+                    icon: None,
+                }
+            ),
+            // Every field left out: each reads as not stated.
+            (launchpad, CanisterConfig::default()),
+        ]
+    );
+}
+
+/// A sender whose own types make a field required (`domains : vec text`,
+/// `name : text`) puts the bare value on the wire. Candid reads a value as an
+/// `opt` of its type, so that sender and this canister still agree.
+#[test]
+fn on_config_update_argument_accepts_fields_sent_as_required() {
+    // Encoded without the interface, so the fields keep the types written here.
+    let bytes = candid_parser::parse_idl_args(
+        r#"(vec { record { principal "uxrrr-q7777-77774-qaaaq-cai"; record {
+          domains = vec { "example.com" };
+          name = "OpenHR";
+        } } })"#,
+    )
+    .unwrap()
+    .to_bytes()
+    .unwrap();
+
+    let decoded: Vec<(Principal, CanisterConfig)> = candid::decode_one(&bytes).unwrap();
+    assert_eq!(
+        decoded[0].1,
+        CanisterConfig {
+            domains: Some(vec!["example.com".to_string()]),
+            name: Some("OpenHR".to_string()),
+            icon: None,
+        }
+    );
+}
+
+/// The price of an optional field: Candid reads a value it cannot fit into an
+/// `opt` as `null` instead of failing. A sender that gets `domains` wrong is
+/// therefore not told so. Its entry reads as saying nothing about domains,
+/// which leaves the files alone.
+#[test]
+fn on_config_update_argument_reads_a_mistyped_optional_field_as_null() {
+    let bytes = candid_parser::parse_idl_args(
+        r#"(vec { record { principal "uxrrr-q7777-77774-qaaaq-cai"; record {
+          domains = "example.com";
+          name = opt "OpenHR";
+        } } })"#,
+    )
+    .unwrap()
+    .to_bytes()
+    .unwrap();
+
+    let decoded: Vec<(Principal, CanisterConfig)> = candid::decode_one(&bytes).unwrap();
+    assert_eq!(
+        decoded[0].1,
+        CanisterConfig {
+            domains: None,
+            name: Some("OpenHR".to_string()),
+            icon: None,
+        }
+    );
 }

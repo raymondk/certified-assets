@@ -16,23 +16,24 @@ use crate::sync::{
 use candid::Principal;
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use wire_types::{
-    ChunkId, CreateAssetArguments, DeleteAssetArguments, Encoding, ExecuteOperationsArguments,
-    MAX_CHUNK_SIZE, Operation, SessionId, SetAssetContentArguments, StartSyncResult,
-    UploadAssetArguments, UploadChunksArguments,
+    CanisterConfig, ChunkId, CreateAssetArguments, DeleteAssetArguments, Encoding,
+    ExecuteOperationsArguments, MAX_CHUNK_SIZE, Operation, SessionId, SetAssetContentArguments,
+    StartSyncResult, UploadAssetArguments, UploadChunksArguments,
 };
 
-/// Where `on_domain_config_update` writes the canister's alternative origins,
-/// which is where Internet Identity looks for them.
+/// Where `on_config_update` writes the canister's alternative origins, which is
+/// where Internet Identity looks for them.
 pub const ALTERNATIVE_ORIGINS_KEY: &str = "/.well-known/ii-alternative-origins";
 
-/// Where `on_domain_config_update` writes the canister's custom domains, which
-/// is where the boundary nodes look for them.
+/// Where `on_config_update` writes the canister's custom domains, which is where
+/// the boundary nodes look for them.
 pub const IC_DOMAINS_KEY: &str = "/.well-known/ic-domains";
 
-/// The most domain names `on_domain_config_update` accepts for one canister:
-/// the number of alternative origins Internet Identity accepts in one file.
-pub const MAX_DOMAINS: usize = 10;
+/// The most domain names `on_config_update` accepts for one canister: the number
+/// of alternative origins Internet Identity accepts in one file.
+pub const MAX_DOMAINS: usize = 100;
 
 impl State {
     /// Begins a sync, returning a fresh session id.
@@ -149,7 +150,7 @@ impl State {
     }
 
     /// Opens a sync that writes just `assets` — one for the `upload_asset`
-    /// endpoint, a fixed few for `on_domain_config_update` — and returns the
+    /// endpoint, a fixed few for `on_config_update` — and returns the
     /// final `execute_operations` call that writes them. All of them ride in
     /// that one call, which applies all-or-nothing, so several files derived
     /// from the same input can never be left disagreeing. The caller drives that
@@ -298,9 +299,9 @@ impl State {
         })
     }
 
-    /// Builds the uploads behind the `on_domain_config_update` endpoint: the
-    /// two well-known files derived from the domain names `domains` assigns to
-    /// `canister_id`.
+    /// Builds the uploads behind the `on_config_update` endpoint: the two
+    /// well-known files derived from the domain names `config` assigns to
+    /// `canister_id`, or `None` if its entry does not state any.
     ///
     /// - [`ALTERNATIVE_ORIGINS_KEY`], the JSON list of `https://<name>` origins
     ///   that lets Internet Identity hand out the same principals on each
@@ -309,23 +310,35 @@ impl State {
     /// - [`IC_DOMAINS_KEY`], the plain-text list, one name per line, that the
     ///   boundary nodes read when registering a custom domain.
     ///
-    /// `domains` maps canister ids to domain names, so one payload can be sent
-    /// unchanged to every canister it covers and each picks out its own entry.
-    /// A payload that does not name this canister is refused rather than read
-    /// as "no domains": it was most likely sent to the wrong canister, and an
-    /// error leaves the existing files alone. An entry with an empty list is
-    /// explicit, and writes two empty lists.
+    /// `config` maps canister ids to their configuration, so one payload can be
+    /// sent unchanged to every canister it covers and each picks out its own
+    /// entry. A payload that does not name this canister is refused rather than
+    /// read as "no domains": it was most likely sent to the wrong canister, and
+    /// an error leaves the existing files alone.
+    ///
+    /// The entry's `domains` has three readings:
+    /// - `None`: the sender said nothing about domains, so there is nothing to
+    ///   write and the files already served stay as they are.
+    /// - `Some` of an empty list: the canister has no domains, stated
+    ///   explicitly. Both files are written as empty lists.
+    /// - `Some` of names: both files are written from them.
+    ///
+    /// The entry's `name` and `icon` are for other receivers; they are not read
+    /// here, so a value this canister would not accept in them cannot block a
+    /// domain update.
     ///
     /// Names are held to the hostname alphabet, which is also what lets the
-    /// JSON be written without an escaper. Internet Identity ignores a file
-    /// listing more than [`MAX_DOMAINS`] origins, so a longer list is refused
-    /// outright rather than written to one file and truncated in the other.
-    pub fn domain_config_uploads(
+    /// JSON be written without an escaper. Internet Identity accepts at most
+    /// [`MAX_DOMAINS`] origins, and requires them to be distinct, so a longer
+    /// list or a repeated name is refused outright rather than written to a
+    /// file Internet Identity would reject. Hostnames are case-insensitive, so
+    /// names differing only in case count as repeats.
+    pub fn config_update_uploads(
         canister_id: Principal,
-        domains: Vec<(Principal, Vec<String>)>,
-    ) -> Result<Vec<UploadAssetArguments>, String> {
-        let mut entries = domains.into_iter().filter(|(id, _)| *id == canister_id);
-        let Some((_, domains)) = entries.next() else {
+        config: Vec<(Principal, CanisterConfig)>,
+    ) -> Result<Option<Vec<UploadAssetArguments>>, String> {
+        let mut entries = config.into_iter().filter(|(id, _)| *id == canister_id);
+        let Some((_, entry)) = entries.next() else {
             return Err(format!("no entry for this canister ({canister_id})"));
         };
         if entries.next().is_some() {
@@ -333,6 +346,9 @@ impl State {
                 "more than one entry for this canister ({canister_id})"
             ));
         }
+        let Some(domains) = entry.domains else {
+            return Ok(None);
+        };
         if domains.len() > MAX_DOMAINS {
             return Err(format!(
                 "{} domain names, but at most {MAX_DOMAINS} are accepted (the number \
@@ -340,6 +356,7 @@ impl State {
                 domains.len()
             ));
         }
+        let mut seen = BTreeSet::new();
         let mut origins = Vec::with_capacity(domains.len());
         let mut lines = String::new();
         for domain in &domains {
@@ -353,12 +370,15 @@ impl State {
                      \"example.com\" (letters, digits, '-' and '.')"
                 ));
             }
+            if !seen.insert(domain.to_ascii_lowercase()) {
+                return Err(format!("domain name {domain:?} is listed more than once"));
+            }
             origins.push(format!("\"https://{domain}\""));
             lines.push_str(domain);
             lines.push('\n');
         }
         let origins = format!("{{\"alternativeOrigins\":[{}]}}", origins.join(","));
-        Ok(vec![
+        Ok(Some(vec![
             UploadAssetArguments {
                 key: ALTERNATIVE_ORIGINS_KEY.to_string(),
                 content_type: "application/json".to_string(),
@@ -371,7 +391,7 @@ impl State {
                 headers: Vec::new(),
                 content: ByteBuf::from(lines.into_bytes()),
             },
-        ])
+        ]))
     }
 
     /// Checks that `session_id` still names the active sync and that the sync is

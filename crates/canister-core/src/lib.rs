@@ -27,8 +27,8 @@ pub use http::{HttpRequest, HttpResponse};
 pub use protection::{IssueTokenArgs, ProtectionStatus, TokenInfo};
 pub use serde_bytes::ByteBuf;
 pub use wire_types::{
-    AssetDetails, ChunkId, ExecuteOperationsArguments, InitArgs, RedirectRule, StartSyncResult,
-    UploadAssetArguments, UploadChunksArguments, Version,
+    AssetDetails, CanisterConfig, ChunkId, ExecuteOperationsArguments, InitArgs, RedirectRule,
+    StartSyncResult, UploadAssetArguments, UploadChunksArguments, Version,
 };
 
 thread_local! {
@@ -187,26 +187,38 @@ async fn upload_assets(assets: Vec<UploadAssetArguments>) -> ByteBuf {
         .unwrap_or_else(|| trap("upload did not finalize"))
 }
 
-/// Reacts to a change in the canister's domain configuration, and returns the
-/// recomputed state hash.
+/// Reacts to a change in the configuration of the group of canisters this one
+/// belongs to.
 ///
-/// `domains` maps canister ids to domain names; the canister looks up its own
-/// id and traps if it is not named, or if it is given more than 10 names. It
-/// then writes two files from those names, together or not at all:
-/// `/.well-known/ii-alternative-origins`, so Internet Identity hands out the
-/// same principals on every domain, and `/.well-known/ic-domains`, which the
-/// boundary nodes read when registering a custom domain.
+/// `config` maps canister ids to their configuration; the canister looks up
+/// its own id and traps if it is not named exactly once. Of its entry it reads
+/// only `domains`:
+///
+/// - Stated, it writes two files from those names, together or not at all:
+///   `/.well-known/ii-alternative-origins`, so Internet Identity hands out the
+///   same principals on every domain, and `/.well-known/ic-domains`, which the
+///   boundary nodes read when registering a custom domain. An empty list
+///   writes two empty lists. It traps on more than 100 names, a repeated name,
+///   or a name that is not a bare hostname.
+/// - Not stated (`null`), it writes nothing: the files already served stay as
+///   they are and the call succeeds.
+///
+/// `name` and `icon` are carried for other receivers of the same payload and
+/// are ignored here.
 ///
 /// The write has everything an [`upload_asset`] implies: refused in by-proposal
 /// mode and during a sync, in no build, and deleted by the next sync unless
-/// `_preserve` names the files.
+/// `_preserve` names the files. Every failure is a trap, so one caller can
+/// treat every receiver of the payload alike.
 ///
 /// Named for the event, not the action, because further reactions are expected
 /// to be added here.
-pub async fn on_domain_config_update(domains: Vec<(Principal, Vec<String>)>) -> ByteBuf {
-    let assets = State::domain_config_uploads(ic_cdk::api::canister_self(), domains)
+pub async fn on_config_update(config: Vec<(Principal, CanisterConfig)>) {
+    let assets = State::config_update_uploads(ic_cdk::api::canister_self(), config)
         .unwrap_or_else(|msg| trap(&msg));
-    upload_assets(assets).await
+    if let Some(assets) = assets {
+        upload_assets(assets).await;
+    }
 }
 
 pub fn get_asset_details(start_after: Option<String>) -> Vec<AssetDetails> {
