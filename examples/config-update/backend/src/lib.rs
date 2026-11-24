@@ -7,7 +7,7 @@
 
 use candid::{CandidType, Principal};
 use ic_cdk::api::{is_controller, msg_caller, trap};
-use ic_cdk::{post_upgrade, pre_upgrade, query, update};
+use ic_cdk::{query, update};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -49,23 +49,6 @@ fn on_config_update(config: ConfigUpdate) {
 #[query]
 fn list_canisters() -> ConfigUpdate {
     CONFIG.with_borrow(Clone::clone)
-}
-
-// A redeploy upgrades the canister, which wipes its heap. Carrying the map
-// across keeps the launchpad populated until the next update arrives.
-
-#[pre_upgrade]
-fn pre_upgrade() {
-    CONFIG
-        .with_borrow(|stored| ic_cdk::storage::stable_save((stored,)))
-        .unwrap_or_else(|e| trap(format!("failed to save the config: {e}")));
-}
-
-#[post_upgrade]
-fn post_upgrade() {
-    let (stored,): (ConfigUpdate,) = ic_cdk::storage::stable_restore()
-        .unwrap_or_else(|e| trap(format!("failed to restore the config: {e}")));
-    CONFIG.with_borrow_mut(|config| *config = stored);
 }
 
 ic_cdk::export_candid!();

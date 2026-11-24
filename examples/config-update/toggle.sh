@@ -3,10 +3,6 @@
 # `on_config_update` on each with the same argument. Run it again to send the
 # other preset.
 #
-#   ./toggle.sh        # switch to the preset that is not live
-#   ./toggle.sh a      # send preset a
-#   ./toggle.sh b      # send preset b
-#
 # Run `icp network start -d` and `icp deploy` first; see README.md.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -32,12 +28,9 @@ if [[ -z "$gateway" ]]; then
 fi
 url() { echo "${gateway/:\/\//://$1.}"; }
 
-preset=${1:-}
-if [[ -z "$preset" ]]; then
-  # The backend holds the last config sent, so it knows which preset is live.
-  current=$(icp canister call --candid "$BACKEND_DID" --query launchpad-backend list_canisters '()')
-  if [[ "$current" == *'"OpenHR"'* ]]; then preset=b; else preset=a; fi
-fi
+# The backend holds the last config sent, so it knows which preset is live.
+current=$(icp canister call --candid "$BACKEND_DID" --query launchpad-backend list_canisters '()')
+if [[ "$current" == *'"OpenHR"'* ]]; then preset=b; else preset=a; fi
 
 case "$preset" in
   a)
@@ -80,10 +73,6 @@ case "$preset" in
         icon = null;
       } };
     })"
-    ;;
-  *)
-    echo "usage: $0 [a|b]" >&2
-    exit 2
     ;;
 esac
 

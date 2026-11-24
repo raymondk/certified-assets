@@ -84,7 +84,10 @@ Run the script again to send the other preset:
 ```
 
 The buttons become **People & HR** and **Team Directory**. Each further run switches
-back and forth. `./toggle.sh a` and `./toggle.sh b` send a specific preset.
+back and forth.
+
+`launchpad-backend` keeps the config in memory only, so after a redeploy the launchpad
+shows no buttons until `./toggle.sh` runs again.
 
 The script also prints each site's `/.well-known/ic-domains` after every run, so you
 can see the asset canisters follow the same config. To look for yourself, open
